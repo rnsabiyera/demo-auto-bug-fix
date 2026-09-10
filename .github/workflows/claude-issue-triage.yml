@@ -1,0 +1,126 @@
+name: Claude Issue Triage
+
+# Verifies, triages, and (where safe) fixes newly raised issues.
+#
+# Triggers:
+#   - a new / reopened issue                -> full verify + triage + fix attempt
+#   - the `claude-fix` label added manually -> re-run on an existing issue
+#   - workflow_dispatch                     -> re-run on any issue number
+on:
+  issues:
+    types: [opened, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to triage
+        required: true
+        type: string
+
+concurrency:
+  group: claude-triage-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    # Skip issues that explicitly @claude - .github/workflows/claude.yml owns those,
+    # and we don't want two agents acting on the same issue.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      ((github.event.action != 'labeled' || github.event.label.name == 'claude-fix') &&
+       !contains(github.event.issue.body, '@claude') &&
+       !contains(github.event.issue.title, '@claude'))
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: write        # create the fix branch
+      issues: write          # comment + label
+      pull-requests: write   # open the fix PR
+      id-token: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Triage and fix
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          claude_args: >-
+            --allowedTools "Read,Glob,Grep,Edit,Write,
+            Bash(gh issue:*),Bash(gh pr:*),Bash(gh label:*),Bash(gh api:*),
+            Bash(git:*),Bash(dotnet:*)"
+          prompt: |
+            You are the issue triage agent for ${{ github.repository }}.
+            The issue to handle is #${{ github.event.issue.number || inputs.issue_number }}.
+
+            Work through these four phases in order. Do not skip a phase.
+
+            ## 1. Understand
+            Read the issue with `gh issue view <n> --comments`. Identify the claimed
+            behaviour, the expected behaviour, and any reproduction steps. Then locate
+            the relevant code (the repo is a .NET solution; find the .sln/.csproj rather
+            than assuming a path).
+
+            ## 2. Verify
+            Try to actually reproduce the problem before believing it.
+            Build with `dotnet build`, and run the affected code path (e.g. `dotnet run`)
+            or add a scratch check if that is the only way to observe the behaviour.
+            Decide which of these it is, and say so explicitly:
+              - CONFIRMED       - reproduced, or the defect is plainly visible in the code
+              - NOT REPRODUCED  - behaves as expected on current main
+              - WORKS AS DESIGNED
+              - NEEDS INFO      - not enough detail to reproduce
+              - NOT A BUG       - question, feature request, or support ask
+            Never claim you reproduced something you did not actually run.
+
+            ## 3. Triage
+            Post ONE comment on the issue with:
+              - your verdict from phase 2 and the evidence for it (commands run, output,
+                and the specific file:line of the root cause if you found it)
+              - the root cause in one or two sentences
+              - what you are doing next (fixing, or why not)
+            Then apply labels with `gh issue edit`. Use only labels that already exist
+            (`gh label list`); create one with `gh label create` only if genuinely missing.
+            Suggested set: `bug`, `needs-info`, `not-a-bug`, `triaged`,
+            `claude-fixed`, `needs-human`.
+
+            ## 4. Fix - only if it is safe to do so
+            Attempt a fix ONLY when ALL of these hold:
+              - the verdict is CONFIRMED
+              - you understand the root cause with high confidence
+              - the change is small and self-contained (roughly a single function or file)
+              - it needs no product, API, or architectural decision
+
+            If so:
+              - branch: `git checkout -b claude/issue-<n>-<short-slug>`
+              - make the minimal fix - do not reformat or refactor surrounding code
+              - verify: `dotnet build` must succeed, and re-run the reproduction from
+                phase 2 to show the wrong output is now correct
+              - commit and push the branch
+              - open a PR with `gh pr create`. The body must contain `Fixes #<n>`, the
+                root cause, the fix, and the before/after output you observed.
+              - label the issue `claude-fixed` and comment with the PR link
+
+            If ANY condition fails: do NOT open a PR. Label the issue `needs-human` and
+            comment explaining precisely what a human needs to decide or supply.
+
+            ## Rules
+            - Never push to `main`, and never merge a PR. A human reviews every fix.
+            - Never touch CI config, workflows, secrets, or auth code as part of a fix.
+            - One comment per phase 3 and phase 4 at most - do not spam the issue thread.
+            - If you cannot complete a phase, say so in the issue comment rather than
+              silently stopping.

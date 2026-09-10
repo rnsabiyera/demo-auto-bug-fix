@@ -1,0 +1,10 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+
+# IDE
+.vs/
+.idea/**/workspace.xml
+.idea/**/tasks.xml
+.idea/**/shelf/
+*.user
